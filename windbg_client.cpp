@@ -30,15 +30,31 @@ std::string WinDbgClient::ExecuteCommand(const std::string& command)
     if (!control_ || !client_)
         return "Error: No debugger control available";
 
-    // Install output capture
+    // Install output capture before Execute so we also collect any output that
+    // arrives while we wait for the target to stop (e.g. breakpoint messages).
     OutputCapture capture;
     capture.Install(client_);
 
-    // Execute the command
     HRESULT hr =
         control_->Execute(DEBUG_OUTCTL_THIS_CLIENT, command.c_str(), DEBUG_EXECUTE_DEFAULT);
 
-    // Get captured output
+    // When running as a headless server the secondary IDebugClient's Execute()
+    // for execution commands (g, t, p, ...) returns immediately — the actual
+    // event pump lives in WinDbg's own thread.  Poll GetExecutionStatus() until
+    // the engine is back at a break so callers always receive a stable state.
+    if (SUCCEEDED(hr))
+    {
+        ULONG status = DEBUG_STATUS_GO;
+        while (SUCCEEDED(control_->GetExecutionStatus(&status)))
+        {
+            if (status == DEBUG_STATUS_BREAK ||
+                status == DEBUG_STATUS_NO_DEBUGGEE ||
+                status == DEBUG_STATUS_OUT_OF_SYNC)
+                break;
+            Sleep(50);
+        }
+    }
+
     std::string result = capture.GetAndClear();
     capture.Uninstall();
 

@@ -1,6 +1,7 @@
 #include <dbgeng.h>
 #include <string>
 #include <windows.h>
+#include <memory>
 
 #include "http_server.hpp"
 #include "mcp_server.hpp"
@@ -11,12 +12,63 @@
 namespace
 {
 
-// Helper to get IDebugControl for output
-static IDebugControl* GetControl(PDEBUG_CLIENT Client)
+// Persistent state for the headless server.  Owned references are released in reset().
+struct AgentState {
+    IDebugClient*  secondary_client  = nullptr;
+    IDebugControl* secondary_control = nullptr;
+    std::unique_ptr<windbg_agent::DmlOutput>    dml;
+    std::unique_ptr<windbg_agent::WinDbgClient> dbg_client;
+
+    void reset() {
+        dml.reset();        // must die before secondary_control is released
+        dbg_client.reset(); // must die before secondary_client is released (it holds QI refs)
+        if (secondary_control) { secondary_control->Release(); secondary_control = nullptr; }
+        if (secondary_client)  { secondary_client->Release();  secondary_client  = nullptr; }
+    }
+
+    ~AgentState() { reset(); }
+};
+
+AgentState                  g_agent_state;
+windbg_agent::HttpServer    g_http_server;
+windbg_agent::MCPServer     g_mcp_server;
+
+// Create secondary IDebugClient + populate AgentState.  Returns false on failure.
+bool setup_agent_state(PDEBUG_CLIENT Client, IDebugControl* control)
 {
-    IDebugControl* control = nullptr;
-    Client->QueryInterface(__uuidof(IDebugControl), (void**)&control);
-    return control;
+    g_agent_state.reset();
+
+    IDebugClient* sec_client = nullptr;
+    if (FAILED(Client->CreateClient(&sec_client))) {
+        control->Output(DEBUG_OUTPUT_ERROR, "Failed to create secondary debug client.\n");
+        return false;
+    }
+
+    IDebugControl* sec_control = nullptr;
+    if (FAILED(sec_client->QueryInterface(__uuidof(IDebugControl), (void**)&sec_control))) {
+        sec_client->Release();
+        control->Output(DEBUG_OUTPUT_ERROR, "Failed to query IDebugControl from secondary client.\n");
+        return false;
+    }
+
+    g_agent_state.secondary_client  = sec_client;
+    g_agent_state.secondary_control = sec_control;
+    g_agent_state.dbg_client = std::make_unique<windbg_agent::WinDbgClient>(sec_client);
+    g_agent_state.dml        = std::make_unique<windbg_agent::DmlOutput>(sec_control);
+    return true;
+}
+
+// Build the exec callback that runs on the command thread.
+windbg_agent::ExecCallback make_exec_cb()
+{
+    auto* dbg_ptr = g_agent_state.dbg_client.get();
+    auto* dml_ptr = g_agent_state.dml.get();
+    return [dbg_ptr, dml_ptr](const std::string& command) -> std::string {
+        dml_ptr->OutputCommand(command.c_str());
+        std::string result = dbg_ptr->ExecuteCommand(command);
+        dml_ptr->OutputCommandResult(result.c_str());
+        return result;
+    };
 }
 
 } // namespace
@@ -29,9 +81,12 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG Version, PULONG Flag
     return S_OK;
 }
 
-// Extension cleanup
+// Extension cleanup - release COM objects before dbgeng unloads
 extern "C" void CALLBACK DebugExtensionUninitialize()
 {
+    if (g_http_server.is_running()) g_http_server.stop();
+    if (g_mcp_server.is_running())  g_mcp_server.stop();
+    g_agent_state.reset();
 }
 
 // Extension notification
@@ -42,19 +97,18 @@ extern "C" void CALLBACK DebugExtensionNotify(ULONG Notify, ULONG64 Argument)
 // Implementation
 HRESULT CALLBACK agent_impl(PDEBUG_CLIENT Client, PCSTR Args)
 {
-    IDebugControl* control = GetControl(Client);
+    IDebugControl* control = nullptr;
+    Client->QueryInterface(__uuidof(IDebugControl), (void**)&control);
     if (!control)
         return E_FAIL;
 
     // Parse subcommand
     std::string args_str = Args ? Args : "";
 
-    // Trim leading whitespace
     size_t start = args_str.find_first_not_of(" \t");
     if (start != std::string::npos)
         args_str = args_str.substr(start);
 
-    // Extract subcommand
     std::string subcmd;
     std::string rest;
     size_t space = args_str.find(' ');
@@ -62,7 +116,6 @@ HRESULT CALLBACK agent_impl(PDEBUG_CLIENT Client, PCSTR Args)
     {
         subcmd = args_str.substr(0, space);
         rest = args_str.substr(space + 1);
-        // Trim leading whitespace from rest
         size_t rest_start = rest.find_first_not_of(" \t");
         if (rest_start != std::string::npos)
             rest = rest.substr(rest_start);
@@ -84,13 +137,19 @@ HRESULT CALLBACK agent_impl(PDEBUG_CLIENT Client, PCSTR Args)
             "Commands:\n"
             "  help                  Show this help\n"
             "  version               Show version information\n"
-            "  http [bind_addr]      Start HTTP server for external tools (port auto-assigned)\n"
-            "  mcp [bind_addr]       Start MCP server for MCP-compatible clients\n"
+            "  http [bind_addr]      Start HTTP server (headless, returns immediately)\n"
+            "  mcp  [bind_addr]      Start MCP server (headless, returns immediately)\n"
+            "  stop                  Stop any running server\n"
+            "\n"
+            "The server runs entirely on background threads so WinDbg remains\n"
+            "fully interactive.  Execution commands (g, t, p, ...) sent by an\n"
+            "LLM will run the target normally and return output when it stops.\n"
             "\n"
             "Examples:\n"
-            "  !agent http                              (start HTTP server on localhost)\n"
-            "  !agent http 0.0.0.0                      (start HTTP server on all interfaces)\n"
-            "  !agent mcp                               (start MCP server on localhost)\n");
+            "  !agent http           (start HTTP server on localhost)\n"
+            "  !agent http 0.0.0.0   (start HTTP server on all interfaces)\n"
+            "  !agent mcp            (start MCP server on localhost)\n"
+            "  !agent stop           (stop the running server)\n");
     }
     else if (subcmd == "version")
     {
@@ -100,21 +159,23 @@ HRESULT CALLBACK agent_impl(PDEBUG_CLIENT Client, PCSTR Args)
     }
     else if (subcmd == "http")
     {
-        // Start HTTP server for external tool integration
-        // Usage: !agent http [bind_addr]
-        // bind_addr: "127.0.0.1" (default, localhost only) or "0.0.0.0" (all interfaces)
-        windbg_agent::WinDbgClient dbg_client(Client);
+        if (g_http_server.is_running())
+        {
+            control->Output(DEBUG_OUTPUT_ERROR,
+                            "HTTP server already running. Use '!agent stop' to stop it first.\n");
+            control->Release();
+            return E_FAIL;
+        }
 
         // Parse optional bind address
         std::string bind_addr = "127.0.0.1";
         if (!rest.empty())
         {
             bind_addr = rest;
-            // Trim whitespace
-            size_t start = bind_addr.find_first_not_of(" \t");
-            size_t end = bind_addr.find_last_not_of(" \t");
-            if (start != std::string::npos)
-                bind_addr = bind_addr.substr(start, end - start + 1);
+            size_t s = bind_addr.find_first_not_of(" \t");
+            size_t e = bind_addr.find_last_not_of(" \t");
+            if (s != std::string::npos)
+                bind_addr = bind_addr.substr(s, e - s + 1);
         }
 
         if (bind_addr != "127.0.0.1")
@@ -124,78 +185,69 @@ HRESULT CALLBACK agent_impl(PDEBUG_CLIENT Client, PCSTR Args)
                 "The server has no authentication.\n", bind_addr.c_str());
         }
 
-        // Get target state
-        std::string target = dbg_client.GetTargetName();
-        std::string state = dbg_client.GetTargetState();
-        ULONG pid = dbg_client.GetProcessId();
-
-        // Create exec callback - executes debugger commands and echoes to console
-        windbg_agent::DmlOutput dml(control);
-        windbg_agent::ExecCallback exec_cb = [&dbg_client, &dml](const std::string& command) -> std::string
+        // Create secondary IDebugClient owned by the background command thread.
+        // This lets Execute("g") and other blocking commands run without holding
+        // the WinDbg extension thread, so the UI stays fully responsive.
+        if (!setup_agent_state(Client, control))
         {
-            dml.OutputCommand(command.c_str());
-            std::string result = dbg_client.ExecuteCommand(command);
-            dml.OutputCommandResult(result.c_str());
-            return result;
-        };
-
-        // Start the HTTP server (OS assigns port)
-        static windbg_agent::HttpServer http_server;
-        if (http_server.is_running())
-        {
-            control->Output(DEBUG_OUTPUT_ERROR,
-                            "HTTP server already running. Stop it before starting a new one.\n");
             control->Release();
             return E_FAIL;
         }
-        int actual_port = http_server.start(exec_cb, bind_addr);
+
+        // Snapshot target info (before background thread starts)
+        std::string target = g_agent_state.dbg_client->GetTargetName();
+        std::string state  = g_agent_state.dbg_client->GetTargetState();
+        ULONG       pid    = g_agent_state.dbg_client->GetProcessId();
+
+        int actual_port = g_http_server.start(make_exec_cb(), bind_addr);
         if (actual_port <= 0)
         {
-            control->Output(DEBUG_OUTPUT_ERROR,
-                            "Failed to start HTTP server.\n");
+            g_agent_state.reset();
+            control->Output(DEBUG_OUTPUT_ERROR, "Failed to start HTTP server.\n");
             control->Release();
             return E_FAIL;
         }
-        std::string url = "http://" + http_server.bind_addr() + ":" + std::to_string(http_server.port());
 
-        // Format and output HTTP server info
-        std::string http_info =
-            windbg_agent::format_http_info(target, pid, state, url);
-        control->Output(DEBUG_OUTPUT_NORMAL, "%s\n", http_info.c_str());
-
-        // Copy to clipboard
-        if (windbg_agent::copy_to_clipboard(http_info))
-        {
-            control->Output(DEBUG_OUTPUT_NORMAL, "[Copied to clipboard]\n");
-        }
-
-        control->Output(DEBUG_OUTPUT_NORMAL, "Press Ctrl+C to stop HTTP server.\n");
-
-        // Set up interrupt check - stop server when user presses Ctrl+C
-        http_server.set_interrupt_check([&dbg_client]() {
-            return dbg_client.IsInterrupted();
+        // /break calls SetInterrupt() directly on the HTTP handler thread so it
+        // works even while g/t/p is blocking the command thread.
+        auto* sec_ctrl = g_agent_state.secondary_control;
+        g_http_server.set_break_callback([sec_ctrl]() {
+            if (sec_ctrl)
+                sec_ctrl->SetInterrupt(DEBUG_INTERRUPT_ACTIVE);
         });
 
-        // Block until server stops (user presses Ctrl+C or sends /shutdown)
-        http_server.wait();
-        control->Output(DEBUG_OUTPUT_NORMAL, "HTTP server stopped.\n");
+        std::string url = "http://" + g_http_server.bind_addr() + ":" +
+                          std::to_string(g_http_server.port());
+
+        std::string http_info = windbg_agent::format_http_info(target, pid, state, url);
+        control->Output(DEBUG_OUTPUT_NORMAL, "%s\n", http_info.c_str());
+
+        if (windbg_agent::copy_to_clipboard(http_info))
+            control->Output(DEBUG_OUTPUT_NORMAL, "[Copied to clipboard]\n");
+
+        control->Output(DEBUG_OUTPUT_NORMAL,
+            "Server running in headless mode - WinDbg is fully interactive.\n"
+            "Use '!agent stop' or POST /shutdown to stop the server.\n");
     }
     else if (subcmd == "mcp")
     {
-        // Start MCP server for MCP-compatible clients
-        // Usage: !agent mcp [bind_addr]
-        // bind_addr: "127.0.0.1" (default, localhost only) or "0.0.0.0" (all interfaces)
-        windbg_agent::WinDbgClient dbg_client(Client);
+        if (g_mcp_server.is_running())
+        {
+            control->Output(DEBUG_OUTPUT_ERROR,
+                            "MCP server already running. Use '!agent stop' to stop it first.\n");
+            control->Release();
+            return E_FAIL;
+        }
 
         // Parse optional bind address
         std::string bind_addr = "127.0.0.1";
         if (!rest.empty())
         {
             bind_addr = rest;
-            size_t start = bind_addr.find_first_not_of(" \t");
-            size_t end = bind_addr.find_last_not_of(" \t");
-            if (start != std::string::npos)
-                bind_addr = bind_addr.substr(start, end - start + 1);
+            size_t s = bind_addr.find_first_not_of(" \t");
+            size_t e = bind_addr.find_last_not_of(" \t");
+            if (s != std::string::npos)
+                bind_addr = bind_addr.substr(s, e - s + 1);
         }
 
         if (bind_addr != "127.0.0.1")
@@ -205,64 +257,56 @@ HRESULT CALLBACK agent_impl(PDEBUG_CLIENT Client, PCSTR Args)
                 "The server has no authentication.\n", bind_addr.c_str());
         }
 
-        // Port 0 lets the MCP server pick a free port
-        int port = 0;
-
-        // Get target state
-        std::string target = dbg_client.GetTargetName();
-        std::string state = dbg_client.GetTargetState();
-        ULONG pid = dbg_client.GetProcessId();
-
-        // Create exec callback - executes debugger commands and echoes to console
-        windbg_agent::DmlOutput dml(control);
-        windbg_agent::ExecCallback exec_cb = [&dbg_client, &dml](const std::string& command) -> std::string
+        if (!setup_agent_state(Client, control))
         {
-            dml.OutputCommand(command.c_str());
-            std::string result = dbg_client.ExecuteCommand(command);
-            dml.OutputCommandResult(result.c_str());
-            return result;
-        };
-
-        // Start the MCP server
-        static windbg_agent::MCPServer mcp_server;
-        if (mcp_server.is_running())
-        {
-            control->Output(DEBUG_OUTPUT_ERROR,
-                            "MCP server already running. Stop it before starting a new one.\n");
             control->Release();
             return E_FAIL;
         }
-        int actual_port = mcp_server.start(port, exec_cb, bind_addr);
+
+        std::string target = g_agent_state.dbg_client->GetTargetName();
+        std::string state  = g_agent_state.dbg_client->GetTargetState();
+        ULONG       pid    = g_agent_state.dbg_client->GetProcessId();
+
+        int actual_port = g_mcp_server.start(0, make_exec_cb(), bind_addr);
         if (actual_port <= 0)
         {
-            control->Output(DEBUG_OUTPUT_ERROR,
-                            "Failed to start MCP server.\n");
+            g_agent_state.reset();
+            control->Output(DEBUG_OUTPUT_ERROR, "Failed to start MCP server.\n");
             control->Release();
             return E_FAIL;
         }
+
         std::string url = "http://" + bind_addr + ":" + std::to_string(actual_port);
 
-        // Format and output MCP server info
-        std::string mcp_info =
-            windbg_agent::format_mcp_info(target, pid, state, url);
+        std::string mcp_info = windbg_agent::format_mcp_info(target, pid, state, url);
         control->Output(DEBUG_OUTPUT_NORMAL, "%s\n", mcp_info.c_str());
 
-        // Copy to clipboard
         if (windbg_agent::copy_to_clipboard(mcp_info))
-        {
             control->Output(DEBUG_OUTPUT_NORMAL, "[Copied to clipboard]\n");
+
+        control->Output(DEBUG_OUTPUT_NORMAL,
+            "Server running in headless mode - WinDbg is fully interactive.\n"
+            "Use '!agent stop' or POST /shutdown to stop the server.\n");
+    }
+    else if (subcmd == "stop")
+    {
+        bool stopped = false;
+        if (g_http_server.is_running())
+        {
+            g_http_server.stop();
+            g_agent_state.reset();
+            stopped = true;
+            control->Output(DEBUG_OUTPUT_NORMAL, "HTTP server stopped.\n");
         }
-
-        control->Output(DEBUG_OUTPUT_NORMAL, "Press Ctrl+C to stop MCP server.\n");
-
-        // Set up interrupt check - stop MCP server when user presses Ctrl+C
-        mcp_server.set_interrupt_check([&dbg_client]() {
-            return dbg_client.IsInterrupted();
-        });
-
-        // Block until server stops (user presses Ctrl+C)
-        mcp_server.wait();
-        control->Output(DEBUG_OUTPUT_NORMAL, "MCP server stopped.\n");
+        if (g_mcp_server.is_running())
+        {
+            g_mcp_server.stop();
+            g_agent_state.reset();
+            stopped = true;
+            control->Output(DEBUG_OUTPUT_NORMAL, "MCP server stopped.\n");
+        }
+        if (!stopped)
+            control->Output(DEBUG_OUTPUT_NORMAL, "No server is currently running.\n");
     }
     else
     {

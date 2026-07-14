@@ -37,15 +37,13 @@ public:
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
 
-    // Start server with OS-assigned port
-    // Returns actual port used
-    // Callbacks will be called on the main thread (in wait())
+    // Start server with OS-assigned port.
+    // Returns actual port used. exec_cb is called on a background thread - no wait() needed.
     // bind_addr: "127.0.0.1" for localhost only, "0.0.0.0" for all interfaces
     int start(ExecCallback exec_cb,
               const std::string& bind_addr = "127.0.0.1");
 
-    // Block until server stops, processing commands on the calling thread
-    // This is where exec_cb gets called
+    // Block the calling thread until the server stops (optional; server runs headlessly without this)
     void wait();
 
     // Stop the server
@@ -60,15 +58,21 @@ public:
     // Get the bind address
     const std::string& bind_addr() const { return bind_addr_; }
 
-    // Queue a command for execution on the main thread (called by HTTP handlers)
+    // Queue a command for execution on the command thread (called by HTTP handlers)
     QueueResult queue_and_wait(const std::string& input);
 
-    // Set interrupt check function (called during wait loop)
+    // Set interrupt check function (polled on the command thread)
     void set_interrupt_check(std::function<bool()> check);
+
+    // Set callback invoked directly from the HTTP handler thread (bypasses command queue)
+    // so a break can be delivered even while g/t/p is blocking the command thread.
+    void set_break_callback(std::function<void()> cb);
 
 private:
     std::function<bool()> interrupt_check_;
+    std::function<void()> break_cb_;
     std::thread server_thread_;
+    std::thread command_thread_;
     std::atomic<bool> running_{false};
     int port_{0};
     std::string bind_addr_{"127.0.0.1"};
@@ -85,6 +89,7 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 
+    void run_command_loop();
     void complete_pending_commands(const std::string& result);
 };
 

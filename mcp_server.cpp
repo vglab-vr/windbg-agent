@@ -189,6 +189,8 @@ int MCPServer::start(int port, ExecCallback exec_cb,
     port_ = impl_->server->port();
     running_.store(true);
 
+    command_thread_ = std::thread([this]() { run_command_loop(); });
+
     return port_;
 }
 
@@ -196,7 +198,7 @@ void MCPServer::set_interrupt_check(std::function<bool()> check) {
     interrupt_check_ = check;
 }
 
-void MCPServer::wait() {
+void MCPServer::run_command_loop() {
     while (running_.load()) {
         if (interrupt_check_ && interrupt_check_()) {
             stop();
@@ -218,11 +220,7 @@ void MCPServer::wait() {
 
         if (cmd) {
             try {
-                if (exec_cb_) {
-                    cmd->result = exec_cb_(cmd->input);
-                } else {
-                    cmd->result = "Error: No exec handler";
-                }
+                cmd->result = exec_cb_ ? exec_cb_(cmd->input) : "Error: No exec handler";
             } catch (const std::exception& e) {
                 cmd->result = std::string("Error: ") + e.what();
             }
@@ -238,6 +236,12 @@ void MCPServer::wait() {
     }
 }
 
+void MCPServer::wait() {
+    if (command_thread_.joinable()) {
+        command_thread_.join();
+    }
+}
+
 void MCPServer::stop() {
     running_.store(false);
     queue_cv_.notify_all();
@@ -245,6 +249,10 @@ void MCPServer::stop() {
 
     if (impl_ && impl_->server) {
         impl_->server->stop();
+    }
+
+    if (command_thread_.joinable()) {
+        command_thread_.join();
     }
 }
 

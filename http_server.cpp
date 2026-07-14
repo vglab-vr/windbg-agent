@@ -113,6 +113,20 @@ int HttpServer::start(ExecCallback exec_cb,
         }).detach();
     });
 
+    // /break is handled directly on the HTTP handler thread (no command queue)
+    // so it works even while a long-running command (g, t, p) is in flight.
+    impl_->server.Post("/break", [this](const httplib::Request&, httplib::Response& res) {
+        if (break_cb_) {
+            break_cb_();
+            nlohmann::json response = {{"status", "break_requested"}, {"success", true}};
+            res.set_content(response.dump(), "application/json");
+        } else {
+            res.status = 503;
+            nlohmann::json response = {{"error", "no break callback set"}, {"success", false}};
+            res.set_content(response.dump(), "application/json");
+        }
+    });
+
     port_ = assigned_port;
     running_.store(true);
 
@@ -123,6 +137,8 @@ int HttpServer::start(ExecCallback exec_cb,
         complete_pending_commands("Error: HTTP server stopped");
     });
 
+    command_thread_ = std::thread([this]() { run_command_loop(); });
+
     return port_;
 }
 
@@ -130,7 +146,11 @@ void HttpServer::set_interrupt_check(std::function<bool()> check) {
     interrupt_check_ = check;
 }
 
-void HttpServer::wait() {
+void HttpServer::set_break_callback(std::function<void()> cb) {
+    break_cb_ = cb;
+}
+
+void HttpServer::run_command_loop() {
     while (running_.load()) {
         if (interrupt_check_ && interrupt_check_()) {
             stop();
@@ -152,11 +172,7 @@ void HttpServer::wait() {
 
         if (cmd) {
             try {
-                if (exec_cb_) {
-                    cmd->result = exec_cb_(cmd->input);
-                } else {
-                    cmd->result = "Error: No exec handler";
-                }
+                cmd->result = exec_cb_ ? exec_cb_(cmd->input) : "Error: No exec handler";
             } catch (const std::exception& e) {
                 cmd->result = std::string("Error: ") + e.what();
             }
@@ -170,7 +186,12 @@ void HttpServer::wait() {
             }
         }
     }
+}
 
+void HttpServer::wait() {
+    if (command_thread_.joinable()) {
+        command_thread_.join();
+    }
     if (server_thread_.joinable()) {
         server_thread_.join();
     }
@@ -185,6 +206,9 @@ void HttpServer::stop() {
     complete_pending_commands("Error: HTTP server stopped");
     if (server_thread_.joinable()) {
         server_thread_.join();
+    }
+    if (command_thread_.joinable()) {
+        command_thread_.join();
     }
 }
 
@@ -249,6 +273,7 @@ std::string format_http_info(
 
     ss << "HTTP API ENDPOINTS:\n";
     ss << "  POST " << url << "/exec     - Execute raw debugger command\n";
+    ss << "  POST " << url << "/break    - Break into a running target (works while g is in flight)\n";
     ss << "  GET  " << url << "/status   - Server status\n";
     ss << "  POST " << url << "/shutdown - Stop server\n\n";
 

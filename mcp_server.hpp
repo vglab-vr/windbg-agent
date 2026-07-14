@@ -37,15 +37,13 @@ public:
     MCPServer(const MCPServer&) = delete;
     MCPServer& operator=(const MCPServer&) = delete;
 
-    // Start MCP server on given port with callback
-    // Returns actual port used (may differ if auto-assigned)
-    // Callback will be called on the main thread (in wait())
+    // Start MCP server on given port with callback.
+    // Returns actual port used. exec_cb is called on a background thread - no wait() needed.
     // bind_addr: "127.0.0.1" for localhost only, "0.0.0.0" for all interfaces
     int start(int port, ExecCallback exec_cb,
               const std::string& bind_addr = "127.0.0.1");
 
-    // Block until server stops, processing commands on the calling thread
-    // This is where exec_cb gets called
+    // Block the calling thread until the server stops (optional; server runs headlessly without this)
     void wait();
 
     // Stop the server
@@ -60,12 +58,13 @@ public:
     // Set interrupt check function (called during wait loop)
     void set_interrupt_check(std::function<bool()> check);
 
-    // Queue a command for execution on the main thread (called by MCP tool handlers)
+    // Queue a command for execution on the command thread (called by MCP tool handlers)
     MCPQueueResult queue_and_wait(const std::string& input);
 
 private:
     std::function<bool()> interrupt_check_;
     std::atomic<bool> running_{false};
+    std::thread command_thread_;
     std::string bind_addr_{"127.0.0.1"};
     int port_{0};
 
@@ -81,6 +80,7 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 
+    void run_command_loop();
     void complete_pending_commands(const std::string& result);
 };
 
