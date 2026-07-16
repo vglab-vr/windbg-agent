@@ -190,6 +190,18 @@ bool WinDbgClient::IsInterrupted() const
     return hr == S_OK;
 }
 
+bool WinDbgClient::IsKernelMode() const
+{
+    if (!control_)
+        return false;
+
+    ULONG debuggee_class = 0, debuggee_qualifier = 0;
+    if (FAILED(control_->GetDebuggeeType(&debuggee_class, &debuggee_qualifier)))
+        return false;
+
+    return debuggee_class == DEBUG_CLASS_KERNEL;
+}
+
 std::string WinDbgClient::GetTargetState() const
 {
     if (!control_)
@@ -239,6 +251,19 @@ ULONG WinDbgClient::GetProcessId() const
             return pid;
     }
     return 0;
+}
+
+std::string WinDbgClient::ExecuteCommandSilent(const std::string& command)
+{
+    if (!control_ || !client_)
+        return "";
+
+    OutputCapture capture;
+    capture.Install(client_);
+    control_->Execute(DEBUG_OUTCTL_THIS_CLIENT, command.c_str(), DEBUG_EXECUTE_DEFAULT);
+    std::string result = capture.GetAndClear();
+    capture.Uninstall();
+    return result;
 }
 
 } // namespace windbg_agent

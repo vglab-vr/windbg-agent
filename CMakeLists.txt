@@ -43,6 +43,7 @@ add_library(windbg_agent SHARED
     settings.cpp
     dml_output.cpp
     windbg_client.cpp
+    dbg_trace.cpp
     http_server.cpp
     mcp_server.cpp
 )

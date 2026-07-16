@@ -1,5 +1,7 @@
 #include <dbgeng.h>
+#include <sstream>
 #include <string>
+#include <vector>
 #include <windows.h>
 #include <memory>
 
@@ -11,6 +13,31 @@
 
 namespace
 {
+
+// Trace defaults
+#define DEFAULT_TRACE_MAX_STEPS 20000
+#define DEFAULT_TRACE_TIMEOUT   300000
+
+// Try to parse a hex address string ("0x..." or plain hex digits), return true on success
+static bool TryParseAddress(const std::string& s, ULONG64& out)
+{
+    if (s.empty())
+        return false;
+    try
+    {
+        size_t pos = 0;
+        const char* p = s.c_str();
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+            out = std::stoull(s, &pos, 16);
+        else
+            out = std::stoull(s, &pos, 16);
+        return pos == s.size();
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
 
 // Persistent state for the headless server.  Owned references are released in reset().
 struct AgentState {
@@ -140,6 +167,7 @@ HRESULT CALLBACK agent_impl(PDEBUG_CLIENT Client, PCSTR Args)
             "  http [bind_addr]      Start HTTP server (headless, returns immediately)\n"
             "  mcp  [bind_addr]      Start MCP server (headless, returns immediately)\n"
             "  stop                  Stop any running server\n"
+            "  trace <end> [opts]    Trace to end addr; opts: start_addr, steps, skip, timeout, eprocess (KD), more_verbose (KD)\n"
             "\n"
             "The server runs entirely on background threads so WinDbg remains\n"
             "fully interactive.  Execution commands (g, t, p, ...) sent by an\n"
@@ -307,6 +335,94 @@ HRESULT CALLBACK agent_impl(PDEBUG_CLIENT Client, PCSTR Args)
         }
         if (!stopped)
             control->Output(DEBUG_OUTPUT_NORMAL, "No server is currently running.\n");
+    }
+    else if (subcmd == "trace")
+    {
+        // Usage: !agent trace <end_addr> [start_addr=<addr>] [steps=<N>] [skip=sym1,sym2] [timeout=<ms>] [eprocess=<addr>]
+        if (rest.empty())
+        {
+            control->Output(DEBUG_OUTPUT_NORMAL,
+                            "Usage: !agent trace <end_addr> [start_addr=<addr>] [steps=<N>] "
+                            "[skip=sym1,sym2] [timeout=<ms>] [eprocess=<addr>] [more_verbose=1]\n");
+            control->Release();
+            return S_OK;
+        }
+
+        windbg_agent::WinDbgClient dbg_client(Client);
+        windbg_agent::TraceParams params;
+        params.max_steps = DEFAULT_TRACE_MAX_STEPS;
+        params.timeout_ms = DEFAULT_TRACE_TIMEOUT;
+
+        // Tokenize rest
+        std::vector<std::string> tokens;
+        {
+            std::istringstream ss(rest);
+            std::string tok;
+            while (ss >> tok)
+                tokens.push_back(tok);
+        }
+
+        // First token is end_addr
+        params.end_address = tokens[0];
+
+        // Parse remaining key=value options
+        for (size_t i = 1; i < tokens.size(); ++i)
+        {
+            const std::string& tok = tokens[i];
+            auto eq = tok.find('=');
+            if (eq == std::string::npos)
+            {
+                control->Output(DEBUG_OUTPUT_ERROR, "Unknown trace option: %s\n", tok.c_str());
+                control->Release();
+                return E_INVALIDARG;
+            }
+            std::string key = tok.substr(0, eq);
+            std::string val = tok.substr(eq + 1);
+
+            if (key == "start_addr")
+            {
+                params.start_address = val;
+            }
+            else if (key == "steps")
+            {
+                try { params.max_steps = std::stoi(val); }
+                catch (...) { control->Output(DEBUG_OUTPUT_ERROR, "Invalid steps value: %s\n", val.c_str()); }
+            }
+            else if (key == "timeout")
+            {
+                try { params.timeout_ms = std::stoi(val); }
+                catch (...) { control->Output(DEBUG_OUTPUT_ERROR, "Invalid timeout value: %s\n", val.c_str()); }
+            }
+            else if (key == "skip")
+            {
+                // Comma-separated list of symbols/addresses to skip (gu)
+                std::istringstream sv(val);
+                std::string sym;
+                while (std::getline(sv, sym, ','))
+                    if (!sym.empty())
+                        params.skip_symbols.push_back(sym);
+            }
+            else if (key == "eprocess")
+            {
+                params.eprocess_addr = val;
+            }
+            else if (key == "more_verbose")
+            {
+                params.more_verbose = (val == "1");
+            }
+            else
+            {
+                control->Output(DEBUG_OUTPUT_ERROR, "Unknown trace option: %s\n", key.c_str());
+                control->Release();
+                return E_INVALIDARG;
+            }
+        }
+
+        control->Output(DEBUG_OUTPUT_NORMAL, "[trace] Tracing to %s (max %d steps)...\n",
+                        params.end_address.c_str(), params.max_steps);
+
+        std::string result = dbg_client.Trace(params);
+        control->Output(DEBUG_OUTPUT_NORMAL, "%s\n", result.c_str());
     }
     else
     {
