@@ -143,6 +143,12 @@ Exposes a single `dbg_exec` tool. Add to your MCP client config:
 }
 ```
 
+Before running a `dbg_exec` or HTTP `/exec` command, the agent checks whether
+the target is running. If so, it requests a break and waits up to 10 seconds
+before sending the command. Commands that resume execution (such as `g`, `t`,
+and `p`) return after WinDbg accepts them; the next command will break the
+target if it is still running.
+
 ### Screenshots
 
 Start `!agent http` to let external tools control WinDbg:
