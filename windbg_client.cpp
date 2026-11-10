@@ -30,30 +30,52 @@ std::string WinDbgClient::ExecuteCommand(const std::string& command)
     if (!control_ || !client_)
         return "Error: No debugger control available";
 
+    // A debugger session cannot inspect a live target.  Interrupt it before
+    // submitting the command, including when a previous request used g/t/p.
+    ULONG status = 0;
+    HRESULT hr = control_->GetExecutionStatus(&status);
+    if (FAILED(hr))
+        return "Error getting debugger execution status: hr=" + std::to_string(hr);
+
+    const auto is_running = [](ULONG value) {
+        return value == DEBUG_STATUS_GO ||
+               value == DEBUG_STATUS_GO_HANDLED ||
+               value == DEBUG_STATUS_GO_NOT_HANDLED ||
+               value == DEBUG_STATUS_STEP_INTO ||
+               value == DEBUG_STATUS_STEP_OVER ||
+               value == DEBUG_STATUS_STEP_BRANCH;
+    };
+
+    if (is_running(status))
+    {
+        hr = control_->SetInterrupt(DEBUG_INTERRUPT_ACTIVE);
+        if (FAILED(hr))
+            return "Error interrupting running target: hr=" + std::to_string(hr);
+
+        const ULONGLONG deadline = GetTickCount64() + 10000;
+        do
+        {
+            hr = control_->GetExecutionStatus(&status);
+            if (FAILED(hr))
+                return "Error waiting for target to break: hr=" + std::to_string(hr);
+            if (!is_running(status))
+                break;
+            Sleep(50);
+        } while (GetTickCount64() < deadline);
+
+        if (is_running(status))
+            return "Error: target did not break within 10 seconds; command was not sent";
+    }
+
+    if (status != DEBUG_STATUS_BREAK && status != DEBUG_STATUS_NO_DEBUGGEE)
+        return "Error: debugger is not in a break state; command was not sent";
+
     // Install output capture before Execute so we also collect any output that
-    // arrives while we wait for the target to stop (e.g. breakpoint messages).
+    // arrives while the command is executed.
     OutputCapture capture;
     capture.Install(client_);
 
-    HRESULT hr =
-        control_->Execute(DEBUG_OUTCTL_THIS_CLIENT, command.c_str(), DEBUG_EXECUTE_DEFAULT);
-
-    // When running as a headless server the secondary IDebugClient's Execute()
-    // for execution commands (g, t, p, ...) returns immediately — the actual
-    // event pump lives in WinDbg's own thread.  Poll GetExecutionStatus() until
-    // the engine is back at a break so callers always receive a stable state.
-    if (SUCCEEDED(hr))
-    {
-        ULONG status = DEBUG_STATUS_GO;
-        while (SUCCEEDED(control_->GetExecutionStatus(&status)))
-        {
-            if (status == DEBUG_STATUS_BREAK ||
-                status == DEBUG_STATUS_NO_DEBUGGEE ||
-                status == DEBUG_STATUS_OUT_OF_SYNC)
-                break;
-            Sleep(50);
-        }
-    }
+    hr = control_->Execute(DEBUG_OUTCTL_THIS_CLIENT, command.c_str(), DEBUG_EXECUTE_DEFAULT);
 
     std::string result = capture.GetAndClear();
     capture.Uninstall();
@@ -66,6 +88,12 @@ std::string WinDbgClient::ExecuteCommand(const std::string& command)
     else if (result.empty())
     {
         result = "(No output)";
+    }
+
+    if (SUCCEEDED(hr) && SUCCEEDED(control_->GetExecutionStatus(&status)) &&
+        is_running(status))
+    {
+        result += "\n(Target running; the next command will interrupt it before execution.)";
     }
     return result;
 }
